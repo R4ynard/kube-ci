@@ -1,7 +1,9 @@
 package oauth2
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -9,16 +11,17 @@ import (
 	"net/url"
 	"path"
 	"strings"
+
+	"github.com/QubitProducts/kube-ci/oauth2/cookie"
 )
 
-type GitHubProvider struct {
+type gitHubProvider struct {
 	*ProviderData
 	Org  string
 	Team string
 }
 
-func NewGitHubProvider(p *ProviderData) *GitHubProvider {
-	p.ProviderName = "GitHub"
+func newGitHubProvider(p *ProviderData) *gitHubProvider {
 	if p.LoginURL == nil || p.LoginURL.String() == "" {
 		p.LoginURL = &url.URL{
 			Scheme: "https",
@@ -44,9 +47,10 @@ func NewGitHubProvider(p *ProviderData) *GitHubProvider {
 	if p.Scope == "" {
 		p.Scope = "user:email"
 	}
-	return &GitHubProvider{ProviderData: p}
+	return &gitHubProvider{ProviderData: p}
 }
-func (p *GitHubProvider) SetOrgTeam(org, team string) {
+
+func (p *gitHubProvider) setOrgTeam(org, team string) {
 	p.Org = org
 	p.Team = team
 	if org != "" || team != "" {
@@ -54,7 +58,7 @@ func (p *GitHubProvider) SetOrgTeam(org, team string) {
 	}
 }
 
-func (p *GitHubProvider) hasOrg(accessToken string) (bool, error) {
+func (p *gitHubProvider) hasOrg(accessToken string) (bool, error) {
 	// https://developer.github.com/v3/orgs/#list-your-organizations
 
 	var orgs []struct {
@@ -106,7 +110,7 @@ func (p *GitHubProvider) hasOrg(accessToken string) (bool, error) {
 	return false, nil
 }
 
-func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
+func (p *gitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 	// https://developer.github.com/v3/orgs/teams/#list-user-teams
 
 	var teams []struct {
@@ -170,7 +174,7 @@ func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 		log.Printf("Missing Team:%q from Org:%q in teams: %v", p.Team, p.Org, presentTeams)
 	} else {
 		var allOrgs []string
-		for org, _ := range presentOrgs {
+		for org := range presentOrgs {
 			allOrgs = append(allOrgs, org)
 		}
 		log.Printf("Missing Organization:%q in %#v", p.Org, allOrgs)
@@ -178,8 +182,7 @@ func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 	return false, nil
 }
 
-func (p *GitHubProvider) GetEmailAddress(s *SessionState) (string, error) {
-
+func (p *gitHubProvider) GetEmailAddress(s *SessionState) (string, error) {
 	var emails []struct {
 		Email   string `json:"email"`
 		Primary bool   `json:"primary"`
@@ -233,4 +236,98 @@ func (p *GitHubProvider) GetEmailAddress(s *SessionState) (string, error) {
 	}
 
 	return "", nil
+}
+
+func (p *gitHubProvider) Redeem(redirectURL, code string) (s *SessionState, err error) {
+	if code == "" {
+		err = errors.New("missing code")
+		return
+	}
+
+	params := url.Values{}
+	params.Add("redirect_uri", redirectURL)
+	params.Add("client_id", p.ClientID)
+	params.Add("client_secret", p.ClientSecret)
+	params.Add("code", code)
+	params.Add("grant_type", "authorization_code")
+	if p.ProtectedResource != nil && p.ProtectedResource.String() != "" {
+		params.Add("resource", p.ProtectedResource.String())
+	}
+
+	var req *http.Request
+	req, err = http.NewRequest("POST", p.RedeemURL.String(), bytes.NewBufferString(params.Encode()))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	var resp *http.Response
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	var body []byte
+	body, err = ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		err = fmt.Errorf("got %d from %q %s", resp.StatusCode, p.RedeemURL.String(), body)
+		return
+	}
+
+	// blindly try json and x-www-form-urlencoded
+	var jsonResponse struct {
+		AccessToken string `json:"access_token"`
+	}
+	err = json.Unmarshal(body, &jsonResponse)
+	if err == nil {
+		s = &SessionState{
+			AccessToken: jsonResponse.AccessToken,
+		}
+		return
+	}
+
+	var v url.Values
+	v, err = url.ParseQuery(string(body))
+	if err != nil {
+		return
+	}
+	if a := v.Get("access_token"); a != "" {
+		s = &SessionState{AccessToken: a}
+	} else {
+		err = fmt.Errorf("no access token found %s", body)
+	}
+	return
+}
+
+// GetLoginURL with typical oauth parameters
+func (p *gitHubProvider) GetLoginURL(redirectURI, state string) string {
+	var a url.URL
+	a = *p.LoginURL
+	params, _ := url.ParseQuery(a.RawQuery)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("approval_prompt", p.ApprovalPrompt)
+	params.Add("scope", p.Scope)
+	params.Set("client_id", p.ClientID)
+	params.Set("response_type", "code")
+	params.Add("state", state)
+	a.RawQuery = params.Encode()
+	return a.String()
+}
+
+// CookieForSession serializes a session state for storage in a cookie
+func (p *gitHubProvider) CookieForSession(s *SessionState, c *cookie.Cipher) (string, error) {
+	return s.EncodeSessionState(c)
+}
+
+// SessionFromCookie deserializes a session from a cookie value
+func (p *gitHubProvider) SessionFromCookie(v string, c *cookie.Cipher) (s *SessionState, err error) {
+	return DecodeSessionState(v, c)
+}
+
+func (p *gitHubProvider) ValidateSessionState(s *SessionState) bool {
+	return validateToken(p, s.AccessToken, nil)
 }

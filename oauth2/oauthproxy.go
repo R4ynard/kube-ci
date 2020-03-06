@@ -22,18 +22,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-type Provider interface {
-	Data() *ProviderData
-	GetEmailAddress(*SessionState) (string, error)
-	Redeem(string, string) (*SessionState, error)
-	ValidateGroup(string) bool
-	ValidateSessionState(*SessionState) bool
-	GetLoginURL(redirectURI, finalRedirect string) string
-	RefreshSessionIfNeeded(*SessionState) (bool, error)
-	SessionFromCookie(string, *cookie.Cipher) (*SessionState, error)
-	CookieForSession(*SessionState, *cookie.Cipher) (string, error)
-}
-
 var (
 	proxyVec     *prometheus.HistogramVec
 	robotsVec    *prometheus.HistogramVec
@@ -58,36 +46,6 @@ func init() {
 		[]string{"code"},
 	)
 
-	histogramOpts.ConstLabels = prometheus.Labels{"handler": "robots"}
-	robotsVec = prometheus.NewHistogramVec(
-		histogramOpts,
-		[]string{"code"},
-	)
-
-	histogramOpts.ConstLabels = prometheus.Labels{"handler": "ping"}
-	pingVec = prometheus.NewHistogramVec(
-		histogramOpts,
-		[]string{"code"},
-	)
-
-	histogramOpts.ConstLabels = prometheus.Labels{"handler": "whitelist"}
-	whitelistVec = prometheus.NewHistogramVec(
-		histogramOpts,
-		[]string{"code"},
-	)
-
-	histogramOpts.ConstLabels = prometheus.Labels{"handler": "signIn"}
-	signInVec = prometheus.NewHistogramVec(
-		histogramOpts,
-		[]string{"code"},
-	)
-
-	histogramOpts.ConstLabels = prometheus.Labels{"handler": "signOut"}
-	signOutVec = prometheus.NewHistogramVec(
-		histogramOpts,
-		[]string{"code"},
-	)
-
 	histogramOpts.ConstLabels = prometheus.Labels{"handler": "start"}
 	startVec = prometheus.NewHistogramVec(
 		histogramOpts,
@@ -100,22 +58,10 @@ func init() {
 		[]string{"code"},
 	)
 
-	histogramOpts.ConstLabels = prometheus.Labels{"handler": "authOnly"}
-	authOnlyVec = prometheus.NewHistogramVec(
-		histogramOpts,
-		[]string{"code"},
-	)
-
 	prometheus.MustRegister(
 		proxyVec,
-		robotsVec,
-		pingVec,
-		whitelistVec,
-		signInVec,
-		signOutVec,
 		startVec,
 		callbackVec,
-		authOnlyVec,
 	)
 }
 
@@ -143,7 +89,6 @@ type OAuthProxy struct {
 	CookieHttpOnly bool
 	CookieExpire   time.Duration
 	CookieRefresh  time.Duration
-	Validator      func(string) bool
 
 	RobotsPath        string
 	MetricsPath       string
@@ -151,22 +96,14 @@ type OAuthProxy struct {
 	OAuthStartPath    string
 	OAuthCallbackPath string
 
-	redirectURL        *url.URL // the url to receive requests at
-	provider           Provider
-	ProxyPrefix        string
-	SignInMessage      string
-	serveMux           http.Handler
-	SetXAuthRequest    bool
-	SkipProviderButton bool
-	PassUserHeaders    bool
-	PassAccessToken    bool
-	CookieCipher       *cookie.Cipher
-	skipAuthRegex      []string
-	skipAuthPreflight  bool
-	compiledRegex      []*regexp.Regexp
-	templates          *template.Template
-	Footer             string
-	TLS                []tls.Certificate
+	redirectURL   *url.URL // the url to receive requests at
+	provider      *gitHubProvider
+	ProxyPrefix   string
+	serveMux      http.Handler
+	CookieCipher  *cookie.Cipher
+	compiledRegex []*regexp.Regexp
+	templates     *template.Template
+	TLS           []tls.Certificate
 }
 
 type UpstreamProxy struct {
@@ -197,7 +134,7 @@ func (t traceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nt.RoundTrip(r)
 }
 
-func NewReverseProxy(target *url.URL) (proxy *httputil.ReverseProxy) {
+func newReverseProxy(target *url.URL) (proxy *httputil.ReverseProxy) {
 	rp := httputil.NewSingleHostReverseProxy(target)
 	rp.Transport = &traceTransport{rp.Transport}
 	return rp
@@ -222,50 +159,33 @@ func setProxyDirector(proxy *httputil.ReverseProxy) {
 		req.URL.RawQuery = ""
 	}
 }
-func NewFileServer(path string, filesystemPath string) (proxy http.Handler) {
-	return http.StripPrefix(path, http.FileServer(http.Dir(filesystemPath)))
-}
 
-func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
+func NewOAuthProxy(opts *Options) *OAuthProxy {
 	serveMux := http.NewServeMux()
 	var auth hmacauth.HmacAuth
 	if sigData := opts.signatureData; sigData != nil {
 		auth = hmacauth.NewHmacAuth(sigData.hash, []byte(sigData.key),
 			SignatureHeader, SignatureHeaders)
 	}
-	for _, u := range opts.proxyURLs {
-		path := u.Path
-		switch u.Scheme {
-		case "http", "https":
-			u.Path = ""
-			log.Printf("mapping path %q => upstream %q", path, u)
-			proxy := NewReverseProxy(u)
-			if !opts.PassHostHeader {
-				setProxyUpstreamHostHeader(proxy, u)
-			} else {
-				setProxyDirector(proxy)
-			}
-			serveMux.Handle(path,
-				&UpstreamProxy{*u, proxy, auth})
-		case "file":
-			if u.Fragment != "" {
-				path = u.Fragment
-			}
-			log.Printf("mapping path %q => file system %q", path, u.Path)
-			proxy := NewFileServer(path, u.Path)
-			serveMux.Handle(path, &UpstreamProxy{*u, proxy, nil})
-		default:
-			panic(fmt.Sprintf("unknown upstream protocol %s", u.Scheme))
-		}
-	}
-	for _, u := range opts.CompiledRegex {
-		log.Printf("compiled skip-auth-regex => %q", u)
+
+	path := opts.proxyURL.Path
+	switch opts.proxyURL.Scheme {
+	case "http", "https":
+		opts.proxyURL.Path = ""
+		log.Printf("mapping path %q => upstream %q", path, opts.proxyURL.String())
+		proxy := newReverseProxy(opts.proxyURL)
+		setProxyDirector(proxy)
+		serveMux.Handle(path,
+			&UpstreamProxy{*opts.proxyURL, proxy, auth})
+
+	default:
+		panic(fmt.Sprintf("unknown upstream protocol %s", opts.proxyURL.Scheme))
 	}
 
 	redirectURL := opts.redirectURL
 	redirectURL.Path = fmt.Sprintf("%s/callback", opts.ProxyPrefix)
 
-	log.Printf("OAuthProxy configured for %s Client ID: %s", opts.provider.Data().ProviderName, opts.ClientID)
+	log.Printf("OAuthProxy configured for Client ID: %s", opts.ClientID)
 	domain := opts.CookieDomain
 	if domain == "" {
 		domain = "<default>"
@@ -278,7 +198,7 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 	log.Printf("Cookie settings: name:%s secure(https):%v httponly:%v expiry:%s domain:%s refresh:%s", opts.CookieName, opts.CookieSecure, opts.CookieHttpOnly, opts.CookieExpire, domain, refresh)
 
 	var cipher *cookie.Cipher
-	if opts.PassAccessToken || (opts.CookieRefresh != time.Duration(0)) {
+	if opts.CookieRefresh != time.Duration(0) {
 		var err error
 		cipher, err = cookie.NewCipher(secretBytes(opts.CookieSecret))
 		if err != nil {
@@ -295,28 +215,16 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		CookieHttpOnly: opts.CookieHttpOnly,
 		CookieExpire:   opts.CookieExpire,
 		CookieRefresh:  opts.CookieRefresh,
-		Validator:      validator,
 
-		RobotsPath:        "/robots.txt",
-		PingPath:          "/ping",
-		MetricsPath:       fmt.Sprintf("%s/metrics", opts.ProxyPrefix),
 		OAuthStartPath:    fmt.Sprintf("%s/start", opts.ProxyPrefix),
 		OAuthCallbackPath: fmt.Sprintf("%s/callback", opts.ProxyPrefix),
 
-		ProxyPrefix:        opts.ProxyPrefix,
-		provider:           opts.provider,
-		serveMux:           serveMux,
-		redirectURL:        redirectURL,
-		skipAuthRegex:      opts.SkipAuthRegex,
-		skipAuthPreflight:  opts.SkipAuthPreflight,
-		compiledRegex:      opts.CompiledRegex,
-		SetXAuthRequest:    opts.SetXAuthRequest,
-		PassUserHeaders:    opts.PassUserHeaders,
-		PassAccessToken:    opts.PassAccessToken,
-		SkipProviderButton: opts.SkipProviderButton,
-		CookieCipher:       cipher,
-		templates:          loadTemplates(),
-		Footer:             opts.Footer,
+		ProxyPrefix:  opts.ProxyPrefix,
+		provider:     opts.provider,
+		serveMux:     serveMux,
+		redirectURL:  redirectURL,
+		CookieCipher: cipher,
+		templates:    loadTemplates(),
 	}
 }
 
@@ -438,16 +346,6 @@ func (p *OAuthProxy) SaveSession(rw http.ResponseWriter, req *http.Request, s *S
 	return nil
 }
 
-func (p *OAuthProxy) RobotsTxt(rw http.ResponseWriter) {
-	rw.WriteHeader(http.StatusOK)
-	fmt.Fprintf(rw, "User-agent: *\nDisallow: /")
-}
-
-func (p *OAuthProxy) PingPage(rw http.ResponseWriter) {
-	rw.WriteHeader(http.StatusOK)
-	fmt.Fprintf(rw, "OK")
-}
-
 func (p *OAuthProxy) ErrorPage(rw http.ResponseWriter, code int, title string, message string) {
 	log.Printf("ErrorPage %d %s %s", code, title, message)
 	rw.WriteHeader(code)
@@ -477,21 +375,6 @@ func (p *OAuthProxy) GetRedirect(req *http.Request) (redirect string, err error)
 	return
 }
 
-func (p *OAuthProxy) IsWhitelistedRequest(req *http.Request) (ok bool) {
-	isPreflightRequestAllowed := p.skipAuthPreflight && req.Method == "OPTIONS"
-	return isPreflightRequestAllowed || p.IsWhitelistedPath(req.URL.Path)
-}
-
-func (p *OAuthProxy) IsWhitelistedPath(path string) (ok bool) {
-	for _, u := range p.compiledRegex {
-		ok = u.MatchString(path)
-		if ok {
-			return
-		}
-	}
-	return
-}
-
 func getRemoteAddr(req *http.Request) (s string) {
 	s = req.RemoteAddr
 	if req.Header.Get("X-Real-IP") != "" {
@@ -506,18 +389,6 @@ func instrument(next http.HandlerFunc, dvec *prometheus.HistogramVec, spanName s
 
 func (p *OAuthProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	switch path := req.URL.Path; {
-	case path == p.RobotsPath:
-		instrument(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-			p.RobotsTxt(rw)
-		}), robotsVec, "robots").ServeHTTP(rw, req)
-	case path == p.MetricsPath:
-		promhttp.Handler().ServeHTTP(rw, req)
-	case path == p.PingPath:
-		instrument(func(rw http.ResponseWriter, req *http.Request) {
-			p.PingPage(rw)
-		}, pingVec, "ping").ServeHTTP(rw, req)
-	case p.IsWhitelistedRequest(req):
-		instrument(p.serveMux.ServeHTTP, whitelistVec, "whitelist").ServeHTTP(rw, req)
 	case path == p.OAuthStartPath:
 		instrument(p.OAuthStart, startVec, "start").ServeHTTP(rw, req)
 	case path == p.OAuthCallbackPath:
@@ -589,19 +460,14 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// set cookie, or deny
-	if p.Validator(session.Email) && p.provider.ValidateGroup(session.Email) {
-		log.Printf("%s authentication complete %s", remoteAddr, session)
-		err := p.SaveSession(rw, req, session)
-		if err != nil {
-			log.Printf("%s %s", remoteAddr, err)
-			p.ErrorPage(rw, 500, "Internal Error", "Internal Error")
-			return
-		}
-		http.Redirect(rw, req, redirect, 302)
-	} else {
-		log.Printf("%s Permission Denied: %q is unauthorized", remoteAddr, session.Email)
-		p.ErrorPage(rw, 403, "Permission Denied", "Invalid Account")
+	log.Printf("%s authentication complete %s", remoteAddr, session)
+	err = p.SaveSession(rw, req, session)
+	if err != nil {
+		log.Printf("%s %s", remoteAddr, err)
+		p.ErrorPage(rw, 500, "Internal Error", "Internal Error")
+		return
 	}
+	http.Redirect(rw, req, redirect, 302)
 }
 
 func (p *OAuthProxy) Proxy(rw http.ResponseWriter, req *http.Request) {
@@ -629,15 +495,6 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 		saveSession = true
 	}
 
-	if ok, err := p.provider.RefreshSessionIfNeeded(session); err != nil {
-		log.Printf("%s removing session. error refreshing access token %s %s", remoteAddr, err, session)
-		clearSession = true
-		session = nil
-	} else if ok {
-		saveSession = true
-		revalidated = true
-	}
-
 	if session != nil && session.IsExpired() {
 		log.Printf("%s removing session. token expired %s", remoteAddr, session)
 		session = nil
@@ -654,7 +511,7 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 		}
 	}
 
-	if session != nil && session.Email != "" && !p.Validator(session.Email) {
+	if session != nil && session.Email == "" {
 		log.Printf("%s Permission Denied: removing session %s", remoteAddr, session)
 		session = nil
 		saveSession = false
@@ -678,21 +535,13 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 	}
 
 	// At this point, the user is authenticated. proxy normally
-	if p.PassUserHeaders {
-		req.Header["X-Forwarded-User"] = []string{session.User}
-		if session.Email != "" {
-			req.Header["X-Forwarded-Email"] = []string{session.Email}
-		}
+	req.Header["X-Forwarded-User"] = []string{session.User}
+	rw.Header().Set("X-Auth-Request-User", session.User)
+	if session.Email != "" {
+		req.Header["X-Forwarded-Email"] = []string{session.Email}
+		rw.Header().Set("X-Auth-Request-Email", session.Email)
 	}
-	if p.SetXAuthRequest {
-		rw.Header().Set("X-Auth-Request-User", session.User)
-		if session.Email != "" {
-			rw.Header().Set("X-Auth-Request-Email", session.Email)
-		}
-	}
-	if p.PassAccessToken && session.AccessToken != "" {
-		req.Header["X-Forwarded-Access-Token"] = []string{session.AccessToken}
-	}
+
 	if session.Email == "" {
 		rw.Header().Set("GAP-Auth", session.User)
 	} else {

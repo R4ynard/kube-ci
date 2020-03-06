@@ -7,6 +7,16 @@ import (
 	"net/url"
 )
 
+func RequestUnparsedResponse(url string, header http.Header) (resp *http.Response, err error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
+
+	return http.DefaultClient.Do(req)
+}
+
 // stripToken is a helper function to obfuscate "access_token"
 // query parameters
 func stripToken(endpoint string) string {
@@ -44,7 +54,7 @@ func stripParam(param, endpoint string) string {
 }
 
 // validateToken returns true if token is valid
-func validateToken(p Provider, access_token string, header http.Header) bool {
+func validateToken(p *gitHubProvider, access_token string, header http.Header) bool {
 	if access_token == "" || p.Data().ValidateURL == nil {
 		return false
 	}

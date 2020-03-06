@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/QubitProducts/kube-ci/oauth2"
 	clientset "github.com/argoproj/argo/pkg/client/clientset/versioned"
 	argoScheme "github.com/argoproj/argo/pkg/client/clientset/versioned/scheme"
 	informers "github.com/argoproj/argo/pkg/client/informers/externalversions"
@@ -46,7 +47,11 @@ import (
 
 var ()
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
+type proxy struct {
+	argoServer string
+}
+
+func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]string{
 		"hello": "world",
 	}
@@ -86,12 +91,17 @@ func main() {
 	masterURL := flag.String("master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
 	shutdownGrace := flag.Duration("grace.shutdown", 2*time.Second, "delay before server shuts down")
 	requestGrace := flag.Duration("grace.requests", 1*time.Second, "delay before server starts shut down")
+	uiBaseURL := flag.String("ui.base", "http://kube-ci", "external name of this service, used in links")
 	configfile := flag.String("config", "", "configuration options")
 	keyfile := flag.String("keyfile", "github-key", "github application key")
 	idsfile := flag.String("idsfiles", "", "newline delimited list of install-ids,if not provided, or empty, all intall-ids are accepted")
 	secretfile := flag.String("secretfile", "webhook-secret", "file containing your webhook secret")
 	appID := flag.Int("github.appid", 0, "github application ID")
-	argoUIBaseURL := flag.String("argo.ui.base", "http://argo", "file containing your webhook secret")
+	clientID := flag.String("github.client.id",os.Getenv("GITHUB_CLIENT_ID"), "github client ID")
+	clientSecret := flag.String("github.client.secret", os.Getenv("GITHUB_CLIENT_SECRET"), "github client secret")
+	githubOrg := flag.String("github.org", "", "only proxy user from this github org")
+	argoServerURL := flag.String("argo.server", "http://argo-server.argo", "service to forward argo UI to")
+	cookieSecret := flag.String("oauth2.cookie.secret", os.Geteng("OAUTH2_COOKIE_SECRET"), "secret for hashing oauth2 cookie state")
 
 	flag.Parse()
 
@@ -185,7 +195,7 @@ func main() {
 		sinf,
 		ghSrc,
 		secret,
-		*argoUIBaseURL,
+		*uiBaseURL,
 		wfconfig,
 	)
 
@@ -204,11 +214,20 @@ func main() {
 	)
 	prometheus.MustRegister(duration)
 
+	oauthOpts := oauth2.NewOptions()
+	oauthOpts.ClientID = *clientID
+	oauthOpts.ClientSecret = *clientSecret
+	oauthOpts.GitHubOrg = *githubOrg
+	oauthOpts.Upstream = *argoServerURL
+	oauthOpts.CookieSecret  =
+	oauthProxy := oauth2.NewOAuthProxy(oauthOpts)
+
+	p := &proxy{argoServer: *argoServerURL}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/",
 		promhttp.InstrumentHandlerDuration(
 			duration,
-			http.HandlerFunc(rootHandler)))
+			p))
 
 	mux.HandleFunc("/webhooks/github",
 		promhttp.InstrumentHandlerDuration(
